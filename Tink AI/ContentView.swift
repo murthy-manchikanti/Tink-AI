@@ -31,6 +31,48 @@ enum UploadStatus: Equatable {
     case failure(message: String)
 }
 
+// ────────────────────────────────────────────────
+// MARK: - Splash / Loading Screen
+// ────────────────────────────────────────────────
+
+struct SplashLoadingView: View {
+    let progress: Double
+    let statusMessage: String
+    
+    var body: some View {
+        VStack(spacing: 40) {
+            Spacer()
+            
+            // Replace "AppLogo" with your actual logo asset name in Assets.xcassets
+            Image("LoadingLogo")
+                .resizable()
+                .scaledToFit()
+                .frame(width: 50, height: 50)
+            
+            VStack(spacing: 16) {
+                ProgressView(value: progress, total: 1.0)
+                    .progressViewStyle(.linear)
+                    .frame(width: 280, height: 10)
+                    .tint(.blue)
+                    .clipShape(RoundedRectangle(cornerRadius: 5))
+                
+                Text(statusMessage)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(.darkGray).opacity(0.12))
+    }
+}
+
+// ────────────────────────────────────────────────
+// MARK: - Main Content View
+// ────────────────────────────────────────────────
+
 struct ContentView: View {
     @State private var engine = LLMEngine()
     @State private var userQuery = ""
@@ -39,14 +81,15 @@ struct ContentView: View {
     @State private var currentSessionId: UUID?
     @State private var isFileImporterPresented = false
     @State private var uploadStatus: UploadStatus = .idle
-
+    @State private var showMainInterface = false
+    
     private var isProcessingUpload: Bool {
         if case .processing = uploadStatus {
             return true
         }
         return false
     }
-
+    
     private var canSend: Bool {
         !userQuery.isEmpty && !engine.isGenerating && !isProcessingUpload
     }
@@ -56,12 +99,36 @@ struct ContentView: View {
     }
     
     var body: some View {
-        NavigationSplitView {
-            sidebarView
-        } detail: {
-            mainChatView
+        ZStack {
+            // Main interface – shown after loading
+            if showMainInterface {
+                NavigationSplitView {
+                    sidebarView
+                } detail: {
+                    mainChatView
+                }
+                .transition(.opacity.animation(.easeInOut(duration: 0.6)))
+            }
+            
+            // Splash screen – shown during model loading
+            if !showMainInterface {
+                SplashLoadingView(
+                    progress: engine.loadProgress,
+                    statusMessage: engine.statusMessage
+                )
+                .transition(.opacity)
+            }
         }
-        .task { await engine.loadModel() }
+        .task {
+            await engine.loadModel()
+            
+            // Brief pause so user sees "Ready!" state
+            try? await Task.sleep(for: .seconds(0.9))
+            
+            withAnimation {
+                showMainInterface = true
+            }
+        }
         .onAppear {
             if chatSessions.isEmpty {
                 createNewSession()
@@ -71,11 +138,12 @@ struct ContentView: View {
         }
     }
     
+    // ────────────────────────────────────────────────
     // MARK: - Sidebar
+    // ────────────────────────────────────────────────
     
     private var sidebarView: some View {
         VStack(spacing: 0) {
-            // New Chat Button
             Button(action: createNewSession) {
                 HStack(spacing: 8) {
                     Image(systemName: "plus.circle.fill")
@@ -93,7 +161,6 @@ struct ContentView: View {
             
             Divider()
             
-            // Chat History
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(chatSessions) { session in
@@ -110,9 +177,9 @@ struct ContentView: View {
     }
     
     private func chatSessionButton(_ session: ChatSession) -> some View {
-        Button(action: { 
+        Button(action: {
             currentSessionId = session.id
-            updateMessagesForSession() 
+            updateMessagesForSession()
         }) {
             HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 4) {
@@ -154,8 +221,6 @@ struct ContentView: View {
     private func updateMessagesForSession() {
         if let session = currentSession {
             messages = session.messages
-            
-            // Sync the engine with the current session's file
             if !session.uploadedFileContent.isEmpty {
                 engine.setUploadedFile(name: session.uploadedFileName, content: session.uploadedFileContent)
             } else {
@@ -176,64 +241,59 @@ struct ContentView: View {
         updateMessagesForSession()
     }
     
+    // ────────────────────────────────────────────────
+    // MARK: - File Handling
+    // ────────────────────────────────────────────────
+    
     private func handleFileSelection(result: Result<URL, Error>) {
         switch result {
         case .success(let url):
-            
-            let isAccessingSecurityScopedResource = url.startAccessingSecurityScopedResource()
-            defer {
-                if isAccessingSecurityScopedResource {
-                    url.stopAccessingSecurityScopedResource()
-                }
-            }
+            let isAccessing = url.startAccessingSecurityScopedResource()
+            defer { if isAccessing { url.stopAccessingSecurityScopedResource() } }
             
             do {
                 let data = try Data(contentsOf: url)
                 let fileName = url.lastPathComponent
                 let fileType = UTType(filenameExtension: url.pathExtension)
-
+                
                 if fileType?.conforms(to: .image) == true {
                     uploadStatus = .processing(message: "Extracting text from image...")
                     Task {
-                        let extractedText = await extractTextFromImageData(data)
+                        let extracted = await extractTextFromImageData(data)
                         await MainActor.run {
-                            if extractedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            if extracted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                                 uploadStatus = .failure(message: "No readable text found in image.")
                                 return
                             }
-
-                            if let index = chatSessions.firstIndex(where: { $0.id == currentSessionId }) {
-                                chatSessions[index].uploadedFileName = fileName
-                                chatSessions[index].uploadedFileContent = extractedText
-                                engine.setUploadedFile(name: fileName, content: extractedText)
-                                uploadStatus = .success(fileName: fileName)
-                            }
+                            updateCurrentSessionFile(fileName: fileName, content: extracted)
+                            uploadStatus = .success(fileName: fileName)
                         }
                     }
                     return
                 }
-
-                // Try to read as text first
+                
                 if let text = String(data: data, encoding: .utf8) {
-                    if let index = chatSessions.firstIndex(where: { $0.id == currentSessionId }) {
-                        chatSessions[index].uploadedFileName = fileName
-                        chatSessions[index].uploadedFileContent = text
-                        
-                        // Also update the engine for current use
-                        engine.setUploadedFile(name: fileName, content: text)
-                        uploadStatus = .success(fileName: fileName)
-                    }
+                    updateCurrentSessionFile(fileName: fileName, content: text)
+                    uploadStatus = .success(fileName: fileName)
                 } else {
                     uploadStatus = .failure(message: "Unsupported file format.")
                 }
             } catch {
                 uploadStatus = .failure(message: "Failed to read file.")
-                print("Error reading file: \(error)")
+                print("File read error: \(error)")
             }
             
         case .failure(let error):
             uploadStatus = .failure(message: "File selection failed.")
-            print("Error selecting file: \(error)")
+            print("File picker error: \(error)")
+        }
+    }
+    
+    private func updateCurrentSessionFile(fileName: String, content: String) {
+        if let index = chatSessions.firstIndex(where: { $0.id == currentSessionId }) {
+            chatSessions[index].uploadedFileName = fileName
+            chatSessions[index].uploadedFileContent = content
+            engine.setUploadedFile(name: fileName, content: content)
         }
     }
     
@@ -246,16 +306,42 @@ struct ContentView: View {
         uploadStatus = .idle
     }
     
-    // MARK: - Main Chat View
+    private func extractTextFromImageData(_ data: Data) async -> String {
+        await Task.detached(priority: .userInitiated) {
+            guard let cgImage = await cgImageFromData(data) else { return "" }
+            
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = true
+            
+            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            do {
+                try handler.perform([request])
+            } catch {
+                return ""
+            }
+            
+            let observations = request.results ?? []
+            return observations
+                .compactMap { $0.topCandidates(1).first?.string }
+                .joined(separator: "\n")
+        }.value
+    }
+    
+    private func cgImageFromData(_ data: Data) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        return CGImageSourceCreateImageAtIndex(source, 0, nil)
+    }
+    
+    // ────────────────────────────────────────────────
+    // MARK: - Main Chat Interface
+    // ────────────────────────────────────────────────
     
     private var mainChatView: some View {
         ZStack(alignment: .bottom) {
-            // Background
-            Color.gray.opacity(0.05)
-                .ignoresSafeArea()
+            Color.gray.opacity(0.05).ignoresSafeArea()
             
             VStack(spacing: 0) {
-                headerView
                 
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -264,7 +350,6 @@ struct ContentView: View {
                                 MessageBubble(message: message)
                             }
                             
-                            // Streaming Response Bubble
                             if !engine.outputText.isEmpty || engine.isGenerating {
                                 MessageBubble(message: ChatMessage(content: engine.outputText, isUser: false))
                                     .id("streaming")
@@ -273,7 +358,7 @@ struct ContentView: View {
                         .padding(.top, 20)
                         .padding(.bottom, 100)
                     }
-                    .onChange(of: engine.outputText) { oldValue, newValue in
+                    .onChange(of: engine.outputText) { _, _ in
                         withAnimation {
                             proxy.scrollTo("streaming", anchor: .bottom)
                         }
@@ -285,41 +370,20 @@ struct ContentView: View {
         }
     }
     
-    private var headerView: some View {
-        HStack {
-            VStack(alignment: .leading) {
-                Text("Tink AI")
-                    .font(.title2).bold()
-                Text(engine.isModelLoaded ? "● Ready" : "○ \(engine.statusMessage)")
-                    .font(.caption)
-                    .foregroundStyle(engine.isModelLoaded ? .green : .orange)
-            }
-            Spacer()
-            Image(systemName: "cpu")
-                .font(.title2)
-                .foregroundStyle(.blue)
-        }
-        .padding()
-        .background(.ultraThinMaterial)
-    }
-    
     private var inputArea: some View {
         VStack(spacing: 0) {
             uploadStatusView
-            // Show uploaded file for current session if any
+            
             if let session = currentSession, !session.uploadedFileName.isEmpty {
                 HStack(spacing: 12) {
                     Image(systemName: "doc.fill")
                         .foregroundStyle(.green)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("File:")
-                            .font(.caption.bold())
-                        Text(session.uploadedFileName)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        Text("File:").font(.caption.bold())
+                        Text(session.uploadedFileName).font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button(action: { clearSessionFile() }) {
+                    Button(action: clearSessionFile) {
                         Image(systemName: "xmark.circle.fill")
                             .foregroundStyle(.red)
                     }
@@ -331,9 +395,9 @@ struct ContentView: View {
                 .cornerRadius(8)
                 .padding(.horizontal)
                 .padding(.top, 8)
-
+                
                 if !session.uploadedFileContent.isEmpty {
-                    Text("Extracted text: \(session.uploadedFileContent.prefix(160))")
+                    Text("Extracted text: \(session.uploadedFileContent.prefix(160))…")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .padding(.horizontal)
@@ -344,7 +408,6 @@ struct ContentView: View {
             Divider()
             
             HStack(alignment: .bottom, spacing: 12) {
-                // File upload button
                 Menu {
                     Button(action: { isFileImporterPresented = true }) {
                         Label("Upload File", systemImage: "doc")
@@ -391,98 +454,55 @@ struct ContentView: View {
             onCompletion: handleFileSelection
         )
     }
-
+    
     private var uploadStatusView: some View {
         Group {
             switch uploadStatus {
-            case .idle:
-                EmptyView()
+            case .idle: EmptyView()
             case .processing(let message):
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text(message)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Text(message).font(.caption).foregroundStyle(.secondary)
                     Spacer()
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
+                .padding(.horizontal, 12).padding(.vertical, 6)
                 .background(Color.orange.opacity(0.08))
                 .cornerRadius(8)
-                .padding(.horizontal)
-                .padding(.top, 8)
+                .padding(.horizontal).padding(.top, 8)
+                
             case .success(let fileName):
                 HStack(spacing: 8) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                    Text("Uploaded \(fileName)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    Text("Uploaded \(fileName)").font(.caption).foregroundStyle(.secondary)
                     Spacer()
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
+                .padding(.horizontal, 12).padding(.vertical, 6)
                 .background(Color.green.opacity(0.08))
                 .cornerRadius(8)
-                .padding(.horizontal)
-                .padding(.top, 8)
+                .padding(.horizontal).padding(.top, 8)
+                
             case .failure(let message):
                 HStack(spacing: 8) {
-                    Image(systemName: "xmark.octagon.fill")
-                        .foregroundStyle(.red)
-                    Text(message)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Image(systemName: "xmark.octagon.fill").foregroundStyle(.red)
+                    Text(message).font(.caption).foregroundStyle(.secondary)
                     Spacer()
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
+                .padding(.horizontal, 12).padding(.vertical, 6)
                 .background(Color.red.opacity(0.08))
                 .cornerRadius(8)
-                .padding(.horizontal)
-                .padding(.top, 8)
+                .padding(.horizontal).padding(.top, 8)
             }
         }
     }
     
-    private func extractTextFromImageData(_ data: Data) async -> String {
-        await Task.detached(priority: .userInitiated) {
-            guard let cgImage = await cgImageFromData(data) else { return "" }
-
-            let request = VNRecognizeTextRequest()
-            request.recognitionLevel = .accurate
-            request.usesLanguageCorrection = true
-
-            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-            do {
-                try handler.perform([request])
-            } catch {
-                return ""
-            }
-
-            let observations = request.results ?? []
-            return observations
-                .compactMap { $0.topCandidates(1).first?.string }
-                .joined(separator: "\n")
-        }.value
-    }
-
-    private func cgImageFromData(_ data: Data) -> CGImage? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
-            return nil
-        }
-        return CGImageSourceCreateImageAtIndex(source, 0, nil)
-    }
     private func sendMessage() {
         let query = userQuery
         userQuery = ""
         
-        // Add user message
         let userMessage = ChatMessage(content: query, isUser: true)
         messages.append(userMessage)
         updateCurrentSession()
         
-        // Set up file context from current session before asking
         if let session = currentSession {
             if !session.uploadedFileContent.isEmpty {
                 engine.setUploadedFile(name: session.uploadedFileName, content: session.uploadedFileContent)
@@ -494,7 +514,6 @@ struct ContentView: View {
         Task {
             await engine.ask(query)
             
-            // Add AI response
             let aiMessage = ChatMessage(content: engine.outputText, isUser: false)
             messages.append(aiMessage)
             updateCurrentSession()
@@ -506,18 +525,21 @@ struct ContentView: View {
     private func updateCurrentSession() {
         if let index = chatSessions.firstIndex(where: { $0.id == currentSessionId }) {
             chatSessions[index].messages = messages
-            // Update title if it's the default
+            
+            // Auto-update title from first user message if still default
             if chatSessions[index].title.hasPrefix("Chat") && messages.count <= 2 {
-                if let firstUserMsg = messages.first(where: { $0.isUser }) {
-                    let preview = firstUserMsg.content.prefix(30)
-                    chatSessions[index].title = String(preview)
+                if let firstUser = messages.first(where: { $0.isUser }) {
+                    let preview = String(firstUser.content.prefix(30))
+                    chatSessions[index].title = preview.isEmpty ? "Chat \(index + 1)" : preview
                 }
             }
         }
     }
 }
 
-// MARK: - Bubble Views
+// ────────────────────────────────────────────────
+// MARK: - Message Rendering
+// ────────────────────────────────────────────────
 
 struct MessageBubble: View {
     let message: ChatMessage
@@ -577,26 +599,22 @@ struct AIContentView: View {
         let nsString = text as NSString
         let matches = regex?.matches(in: text, options: [], range: NSRange(location: 0, length: nsString.length)) ?? []
         
-        var lastEndIndex = 0
+        var lastEnd = 0
         for match in matches {
-            let textRange = NSRange(location: lastEndIndex, length: match.range.location - lastEndIndex)
+            let textRange = NSRange(location: lastEnd, length: match.range.location - lastEnd)
             if textRange.length > 0 {
                 result.append(TextPart(content: nsString.substring(with: textRange), isMath: false))
             }
             
-            var mathContent = nsString.substring(with: match.range)
-            if mathContent.hasPrefix("$$") {
-                mathContent = String(mathContent.dropFirst(2).dropLast(2))
-            } else {
-                mathContent = String(mathContent.dropFirst(1).dropLast(1))
-            }
+            var mathStr = nsString.substring(with: match.range)
+            mathStr = mathStr.hasPrefix("$$") ? String(mathStr.dropFirst(2).dropLast(2)) : String(mathStr.dropFirst().dropLast())
             
-            result.append(TextPart(content: mathContent, isMath: true))
-            lastEndIndex = match.range.location + match.range.length
+            result.append(TextPart(content: mathStr, isMath: true))
+            lastEnd = match.range.location + match.range.length
         }
         
-        if lastEndIndex < nsString.length {
-            result.append(TextPart(content: nsString.substring(from: lastEndIndex), isMath: false))
+        if lastEnd < nsString.length {
+            result.append(TextPart(content: nsString.substring(from: lastEnd), isMath: false))
         }
         return result
     }
